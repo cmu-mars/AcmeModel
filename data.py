@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 
+import argparse
+
 import rospy
 import rostopic
 from std_msgs.msg import String
@@ -21,6 +23,8 @@ import rospy
 from datetime import datetime
 from nodelet.srv import *
 from std_msgs.msg import String
+import yaml
+
 
 currentService = ""
 currentReported = []
@@ -169,7 +173,22 @@ def newServiceHandler(service):
         noServiceIntermediator.append(service)
     return 'Passed'
 
-def get_current_services():
+def get_current_state(ignore_nodes, ignore_services, ignore_topics):
+    caller_ide = "/acme_data_collector"
+    m = xmlrpclib.ServerProxy(os.environ['ROS_MASTER_URI'])
+    code, msg, val = m.getSystemState(caller_ide)
+    if code == 1:
+        pubs, subs, srvs = val
+    else:
+        print "Call to ROS Master failed", code, msg
+        sys.exit()
+
+    srvs = [srv for srv in srvs if not srv[0] in ignore_services and not set(srv[1]).issubset(ignore_nodes)]
+    pubs = [pub for pub in pubs if not pub[0] in ignore_topics and not set(pub[1]).issubset(ignore_nodes)]
+    subs = [sub for sub in subs if not sub[0] in ignore_topics and not set(pub[1]).issubset(ignore_nodes)]
+    return pubs, subs, srvs
+
+def get_current_services(ignore_services, ignore_nodes):
     caller_ide = '/handler'
     m = xmlrpclib.ServerProxy(os.environ['ROS_MASTER_URI'])
     code, msg, val = m.getSystemState(caller_ide)
@@ -177,10 +196,12 @@ def get_current_services():
         pubs, subs, srvs = val
     else:
         print "call failed", code, msg
+
+    srvs = [srv for srv in srvs if not srv[0] in ignore_services and not set(srv[1]).issubset(ignore_nodes)]
     return srvs
 
 
-def parse_info_sub(info):
+def parse_info_sub(info, ignore_topics, ignore_nodes):
     reached_sub = False
     subscribers = []
     for l in info.splitlines():
@@ -191,13 +212,14 @@ def parse_info_sub(info):
             if len(parts) < 3:
                 rospy.loginfo("Something is wrong here!")
                 continue
-            subscribers.append(parts[2])
+            if parts[2] not in ignore_nodes:
+                subscribers.append(parts[2])
         elif l.startswith('Subscribers:'):
             reached_sub = True
     return subscribers
 
 
-def parse_info_pub(info):
+def parse_info_pub(info, ignore_topics, ignore_nodes):
     reached_pub = False
     publishers = []
     for l in info.splitlines():
@@ -208,7 +230,8 @@ def parse_info_pub(info):
             if len(parts) < 3:
                 rospy.loginfo("Something is wrong here!")
                 continue
-            publishers.append(parts[2])
+            if  parts[2] not in ignore_nodes:
+                publishers.append(parts[2])
         elif l.startswith('Publishers:'):
             reached_pub = True
     return publishers
@@ -272,9 +295,10 @@ def send_nodes(nodes):
     return y
 
 
-def arch():
+def arch(filters):
     try:
-        rospy.init_node('handler', anonymous=True)
+        rospy.init_node('acme_data_collector')
+        filters.ignore_node.append('acme_data_collector') # Add this node to the set of things to ignore
 
         currentServices = []
         loggerCount = 0
@@ -291,21 +315,32 @@ def arch():
         global noServiceIntermediator
         global oldnoServiceIntermediator
 
+        # append list to add / to every node
+        filters.ignore_node = map((lambda x : '/' + x), filters.ignore_node)
+
 
         service_dict = {}
         old_service_dict = {}
         length = 0
         updated = False
         oldReported = list()
+        shortcircuit = False
 
-        while not rospy.is_shutdown():
-            new_topics = rospy.get_published_topics()
+        rate = 1.0/float(filters.rate) #The Hz for the rate
+        r = rospy.Rate(rate)
+
+        while not rospy.is_shutdown() and not shortcircuit:
+            shortcircuit = filters.once
+            pubs, subs, srvs = get_current_state(filters.ignore_node, filters.ignore_service, filters.ignore_topic)
+            pubs = [pub[0] for pub in pubs]
+            subs = [sub[0] for sub in subs]
+            new_topics = [topic for topic in rospy.get_published_topics() if topic[0] in pubs or topic[0] in subs]
             new_nodes = rosnode.get_node_names()
             new_publish = {}
             new_publish1 = {}
 
-            inc_topics = [item for item in new_topics if item not in last_topics]
-            inc_nodes = [item for item in new_nodes if item not in last_nodes]
+            inc_topics = [item for item in new_topics if item not in last_topics and item not in filters.ignore_topic]
+            inc_nodes = [item for item in new_nodes if item not in last_nodes and item not in filters.ignore_node]
             inc_service_dict = {}
             inc_publish = {}
             inc_publish1 = {}
@@ -314,8 +349,8 @@ def arch():
 
             for topic, typ in new_topics:
                 info = rostopic.get_info_text(topic)
-                subscribers = parse_info_sub(info)
-                publishers = parse_info_pub(info)
+                subscribers = parse_info_sub(info, filters.ignore_topic, filters.ignore_node)
+                publishers = parse_info_pub(info, filters.ignore_topic, filters.ignore_node)
                 new_publish[topic] = set(subscribers)
                 new_publish1[topic] = set(publishers)
 
@@ -327,8 +362,8 @@ def arch():
 
 
             try:
-                for newService, Provider in get_current_services():
-                    if not newService in currentServices:
+                for newService, Provider in srvs:
+                    if not newService in currentServices and not newService in filters.ignore_service:
                         currentServices.append(newService)
                         newServiceHandler(newService)
                         service_dict[newService] = [rosservice.get_service_type(newService), rosservice.get_service_args(newService)]
@@ -371,16 +406,72 @@ def arch():
                 last_publish = dict(new_publish)
                 last_publish1 = dict(new_publish1)
                 updated = False
-
-                requests.get(URL, data=json.dumps(y))
+                if filters.file is not None:
+                    output = open(filters.file, 'wb')
+                    output.write(json.dumps(y, indent=4))
+                    output.close()
+                else:
+                    requests.get(URL, data=json.dumps(y))
+                r.sleep()
 
     except Exception as e:
         print e
         pass
 
+def preprocess_ignores(args):
+    if not hasattr(args, 'ignore_node') or args.ignore_node is None:
+        args.ignore_node=[]
+    if not hasattr(args, 'ignore_topic') or args.ignore_topic is None:
+        args.ignore_topic=[]
+    if not hasattr(args, 'ignore_service') or args.ignore_service is None:
+        args.ignore_service=[]
+    if not hasattr(args,'ignore_action') or args.ignore_action is None:
+        args.ignore_action=[]
+
+def process_ignores(args):
+    with open(args.ignore, 'r') as stream:
+        ignore = yaml.load(stream)
+    if "nodes" in ignore:
+        args.ignore_node.extend(ignore["nodes"])
+    if "topics" in ignore:
+        args.ignore_topic.extend(ignore["topics"])
+    if "services" in ignore:
+        args.ignore_service.extend(ignore["services"])
+    if "actions" in ignore:
+        args.ignore_action.extend(ignore["actions"])
+
+
+
 if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-u', '--url', type=str, default=URL, help="The URL to send the JSON data")
+    parser.add_argument('-f', '--file',type=str, help="Output to this file, instead of sending to URL")
+    parser.add_argument('-n', '--ignore-node', type=str, action='append', help="Ignore a node with this name")
+    parser.add_argument('-t', '--ignore-topic', type=str, action='append', help='Ignore a topic with this name')
+    parser.add_argument('-s', '--ignore-service', type=str, action='append', help='Ignore a service with this name')
+    parser.add_argument('-a', '--ignore-action', type=str, action='append', help='Ignore an action with this name')
+    parser.add_argument('-i', '--ignore', type=str, help='The YAML file containing sections of topic, service, node, and action to ignore')
+    parser.add_argument('-1', '--once', action='store_true', help='Only produce the information once')
+    parser.add_argument('-r', '--rate', default=10, type=int, help='The loop rate (seconds)')
+
+    args = parser.parse_args()
+
+    if args.url is not None:
+        URL = args.url
+
+    if args.file is not None:
+        args.file = os.path.expandvars(args.file)
+
+    preprocess_ignores(args)
+    if args.ignore is not None:
+        args.ignore = os.path.expandvars(args.ignore)
+        if not os.path.isfile(args.ignore):
+            print("The ignore file does not exist! " %args.ignore);
+            sys.exit(1)
+        process_ignores(args)
     try:
-        arch()
+        arch(args)
     except rospy.ROSInterruptException:
         print e
         pass
